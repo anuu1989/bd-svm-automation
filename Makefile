@@ -20,6 +20,8 @@ METHOD  ?= GET
 API_PATH ?=
 DATA    ?=
 HREF    ?=
+SEVERITY ?=
+STATUS_EXPECT ?=
 YES     ?=
 BD      := $(CLI) bd
 SCOPE   := $(if $(PROJECT),--project "$(PROJECT)") $(if $(VERSION),--version "$(VERSION)")
@@ -219,8 +221,9 @@ bd-api: install  ## BD: any endpoint: make bd-api METHOD=GET API_PATH=/api/proje
 	$(BD) api $(METHOD) "$(API_PATH)" $(if $(DATA),--data '$(DATA)') $(CONFIRM)
 
 # ---- SVM / pipeline --------------------------------------------------------------
-svm-check: install need-name  ## SVM: is NAME CV (VULN optional) present? exit 1 if not
-	$(CLI) svm-check --name "$(NAME)" --component-version "$(CV)" --vuln-id "$(VULN)"
+svm-check: install need-name  ## SVM: is NAME CV present? opt: VULN SEVERITY STATUS_EXPECT; exit 1 if not
+	$(CLI) svm-check --name "$(NAME)" --component-version "$(CV)" --vuln-id "$(VULN)" \
+		$(if $(SEVERITY),--severity "$(SEVERITY)") $(if $(STATUS_EXPECT),--remediation-status "$(STATUS_EXPECT)")
 
 svm-check-absent: install need-name  ## SVM: is NAME CV absent? (delete test) exit 1 if still present
 	$(CLI) svm-check --name "$(NAME)" --component-version "$(CV)" --vuln-id "$(VULN)" --expect-absent

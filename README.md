@@ -55,6 +55,7 @@ make tick-idle     # advance due runs; schedule this with cron / CI (see docs)
 
 | Doc | Contents |
 |---|---|
+| [docs/HOWTO.md](docs/HOWTO.md) | **Start here:** step-by-step guides (connect, configure SVM + pipeline, schedule, read results, handle failures) |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Flow, state machine, batching/overlap/coalescing, failure semantics |
 | [docs/TESTING.md](docs/TESTING.md) | Scenarios, latency, evidence, mock server, automated tests |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting, with examples |

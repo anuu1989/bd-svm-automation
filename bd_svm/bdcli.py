@@ -213,7 +213,9 @@ def h_api(cfg, a):
 
 
 def h_svm_check(cfg, a):
-    subject = Subject(a.name, a.component_version, a.vuln_id or "", cfg.blackduck.project_name)
+    expected = {"severity": a.severity, "remediation_status": a.remediation_status}
+    subject = Subject(a.name, a.component_version, a.vuln_id or "", cfg.blackduck.project_name,
+                      expected={k: v for k, v in expected.items() if v})
     results = [c.check(subject) for c in build_checks(cfg.svm)]
     ok, detail = evaluate(results, not a.expect_absent, cfg.svm.require)
     _out({"passed": ok, "detail": detail, "checks": [r.as_dict() for r in results]})
@@ -290,6 +292,9 @@ def register(sub) -> None:
     p.add_argument("--name", required=True)
     p.add_argument("--component-version", required=True)
     p.add_argument("--vuln-id", default="")
+    p.add_argument("--severity", default="", help="expected severity (needs svm.api.fields.severity)")
+    p.add_argument("--remediation-status", default="",
+                   help="expected remediation status (needs svm.api.fields.remediation_status)")
     p.add_argument("--expect-absent", action="store_true", help="pass when NOT found (delete test)")
     p.set_defaults(fn=h_svm_check)
     p = sub.add_parser("pipeline-trigger", help="trigger the verification pipeline now")
