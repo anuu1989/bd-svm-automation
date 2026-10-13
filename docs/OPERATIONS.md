@@ -26,6 +26,14 @@ cron example:
 */20 * * * * cd /opt/bd-svm-automation && make tick-idle >> /var/log/bd-svm.log 2>&1
 ```
 
+GitHub Actions: `.github/workflows/e2e-sync.yml` runs `make tick-idle` every 30
+minutes and carries `data/state.db` between runs with the Actions cache
+(secrets/variables are listed at the top of the file). `ci.yml` runs
+`make ci` on push/PR. Run any target by hand via *Actions > E2E Black
+Duck-SVM sync > Run workflow*. Notes: schedules are best-effort and GitHub
+disables them after 60 days without repo activity; a failed run makes the job
+fail, which triggers GitHub's failure notification.
+
 GitLab CI schedule job: `script: [make tick-idle]`, persist `data/` with a
 cache or artifact (or point `test.state_db` to a mounted volume). Only one
 process should tick at a time.
