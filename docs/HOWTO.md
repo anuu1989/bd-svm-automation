@@ -1,383 +1,316 @@
 # How-to guide
 
-Task-oriented steps for working with the Black Duck → SVM sync test. For the
-design see [ARCHITECTURE.md](ARCHITECTURE.md); for every setting see
-[CONFIGURATION.md](CONFIGURATION.md).
+Task-oriented steps for running, configuring and extending the two-phase Black
+Duck BOM lifecycle automation. For the design see [DESIGN.md](DESIGN.md); for
+every setting see [SETTINGS.md](SETTINGS.md); when something fails see
+[RUNBOOK.md](RUNBOOK.md).
 
 **Contents**
 
-1. [Try it in two minutes (no credentials)](#1-try-it-in-two-minutes-no-credentials)
-2. [Connect to your Black Duck](#2-connect-to-your-black-duck)
-3. [Choose which components to test](#3-choose-which-components-to-test)
-4. [Wire up the SVM API check](#4-wire-up-the-svm-api-check)
-5. [Wire up the pipeline trigger](#5-wire-up-the-pipeline-trigger)
-6. [Run your first real cycle](#6-run-your-first-real-cycle)
-7. [Schedule it](#7-schedule-it)
-8. [Read the results](#8-read-the-results)
-9. [Deal with failures and leftovers](#9-deal-with-failures-and-leftovers)
-10. [Get notified](#10-get-notified)
-11. [Add the SVM UI check](#11-add-the-svm-ui-check)
-12. [Test more, faster](#12-test-more-faster)
-13. [Do one-off Black Duck operations](#13-do-one-off-black-duck-operations)
-14. [Adapt to a different Black Duck version](#14-adapt-to-a-different-black-duck-version)
-15. [Run in Docker or GitHub Actions](#15-run-in-docker-or-github-actions)
+1. [Try it without a Black Duck server](#1-try-it-without-a-black-duck-server)
+2. [Set up against your Black Duck](#2-set-up-against-your-black-duck)
+3. [Check the connection (smoke test)](#3-check-the-connection-smoke-test)
+4. [Run phase 1 and phase 2 locally](#4-run-phase-1-and-phase-2-locally)
+5. [Read the HTML report](#5-read-the-html-report)
+6. [Test a different component or CVE](#6-test-a-different-component-or-cve)
+7. [Use different assessment values](#7-use-different-assessment-values)
+8. [Adapt to your server (paths, media types, TLS)](#8-adapt-to-your-server-paths-media-types-tls)
+9. [Run it on GitHub Actions](#9-run-it-on-github-actions)
+10. [Change the schedule or the wait](#10-change-the-schedule-or-the-wait)
+11. [Get notified on failure](#11-get-notified-on-failure)
+12. [Recover after a failed or missed phase](#12-recover-after-a-failed-or-missed-phase)
+13. [Add a step, assertion or API helper](#13-add-a-step-assertion-or-api-helper)
+14. [Test the framework itself](#14-test-the-framework-itself)
+15. [Command cheat sheet](#15-command-cheat-sheet)
 
 ---
 
-## 1. Try it in two minutes (no credentials)
+## 1. Try it without a Black Duck server
 
 ```bash
 make demo
 ```
 
-This starts a fake Black Duck + SVM + pipeline on `127.0.0.1:8099`, runs one
-cycle with four components (one per scenario), polls until both the ADD and
-DELETE tests pass, prints the report, and shows the fake BOM is empty
-afterwards. Use it to see what a successful run looks like before touching
-real systems.
+Starts a built-in mock Black Duck (10 baseline BOM components), runs the smoke
+test, phase 1 (12 steps), prints `state.json`, runs phase 2 (5 steps) and shows
+the BOM count `10 → 11 → 10`. Nothing leaves your machine.
 
-To poke at the mock yourself:
+Want to drive it yourself?
 
 ```bash
-make mock-server                     # terminal 1
-python -m bd_svm -c config/config.mock.yaml start      # terminal 2
-python -m bd_svm -c config/config.mock.yaml status
-curl localhost:8099/mock/state       # BOM + what SVM currently shows
+make mock-server                                   # terminal 1, listens on :8099
+export BD_HOST=http://127.0.0.1:8099 BD_API_KEY=anything   # terminal 2
+make health && make phase1 && make state-show && make phase2
 ```
 
-## 2. Connect to your Black Duck
+Inject a server error to see the failure handling:
 
-1. Create a **dedicated** project and version in Black Duck (for example
-   `svm-e2e-test` / `main`). The tool adds and deletes components in its BOM —
-   never point it at a real product BOM.
-2. Create an API token for a user with write access to that project.
-3. Set up the config files:
+```bash
+curl -X POST "http://127.0.0.1:8099/mock/fail-next?status=500&count=1"
+```
+
+(GET/PUT/DELETE are retried with backoff, so a single 500 is absorbed; use
+`BD_HTTP_RETRIES=0` to see the failure surface.)
+
+## 2. Set up against your Black Duck
+
+1. **Create a dedicated project and version** in Black Duck (default names:
+   `svm-e2e-test` / `main`). The phases add to and delete from its BOM — never
+   use a real product BOM.
+2. **Create an API token** for a user who can read the KB and edit that
+   project's BOM.
+3. Install and configure:
 
    ```bash
-   make config            # copies config.example.yaml -> config/config.yaml, .env.example -> .env
+   make install
+   cp .env.example .env
    ```
 
 4. Edit `.env`:
 
    ```ini
-   BLACKDUCK_URL=https://blackduck.mycompany.com
-   BLACKDUCK_API_TOKEN=<token>
-   BLACKDUCK_PROJECT=svm-e2e-test
-   BLACKDUCK_PROJECT_VERSION=main
+   BD_HOST=https://blackduck.mycompany.com
+   BD_API_KEY=<your token>
+   BD_PROJECT_NAME=svm-e2e-test
+   BD_PROJECT_VERSION=main
    ```
 
-5. Check the connection:
+`.env` is git-ignored. Anything already exported in your shell wins over
+`.env`.
 
-   ```bash
-   make doctor            # config valid? auth OK? project/version found?
-   make bd-whoami         # which user and server version
-   ```
-
-If `doctor` says the project is not found, fix the names or the token's access.
-A TLS error means a self-signed certificate: set `blackduck.verify_ssl: false`
-(lab only) in `config/config.yaml`.
-
-## 3. Choose which components to test
-
-The tool needs components that exist in the Black Duck knowledge base. Check
-what is available:
+## 3. Check the connection (smoke test)
 
 ```bash
-make bd-search NAME=log4j-core VERSIONS=1          # versions of a component
-make bd-component-vulns NAME=log4j-core CV=2.14.1  # its vulnerabilities
+make health
 ```
 
-Then list them under `blackduck.candidates` in `config/config.yaml`:
+Five read-only checks: bearer token, server version endpoint, project exists,
+project version exists, KB component resolvable. All must pass before running
+the phases. The HTML report is `reports/health-report.html`.
 
-```yaml
-blackduck:
-  candidates:
-    - { name: log4j-core, version: "2.14.1" }                        # standard
-    - { name: jackson-databind, version: "2.9.8",
-        scenario: remediation, status: IGNORED }                     # status must show in SVM
-    - { name: commons-text, version: "1.9",
-        scenario: upgrade, upgrade_to: "1.10.0" }                    # swap to fixed version
-    - { name: some-clean-lib, version: "1.0.0", scenario: negative } # no vulns: must NOT show
-test:
-  batch_size: 3          # how many candidates per cycle
-```
-
-Rules of thumb:
-
-- `standard`, `remediation`, `upgrade` need a version **with** at least one
-  vulnerability; `negative` needs one **without**.
-- A candidate already in the test BOM is skipped.
-- Details of each scenario: [TESTING.md](TESTING.md#scenarios).
-
-## 4. Wire up the SVM API check
-
-Goal: given a component name, make the tool receive the SVM records for it.
-
-1. Find the SVM endpoint that lists vulnerabilities for a component, and try it
-   with curl, e.g.:
-
-   ```bash
-   curl -H "Authorization: Bearer $SVM_API_TOKEN" \
-     "https://svm.mycompany.com/api/v1/vulnerabilities?component=log4j-core"
-   ```
-
-2. Note where the record list is in the response (`items`, `data.items`, …) and
-   what the severity / status keys are called.
-3. Put it in `config/config.yaml`:
-
-   ```yaml
-   svm:
-     require: all
-     api:
-       enabled: true
-       base_url: ${SVM_URL}
-       token: ${SVM_API_TOKEN}
-       path: /api/v1/vulnerabilities
-       params: { component: "{component_name}" }   # also {component_version} {vuln_id} {project_name}
-       list_key: data.items                        # "" = auto-detect
-       fields: { severity: severity, remediation_status: status }   # optional field checks
-   ```
-
-   and `SVM_URL` / `SVM_API_TOKEN` in `.env`.
-4. Test the mapping **before** running a cycle. Add a component to Black Duck
-   manually, run the pipeline (or wait for the sync), then:
-
-   ```bash
-   make svm-check NAME=log4j-core CV=2.14.1 VULN=CVE-2021-44228      # exit 0 = found
-   make svm-check-absent NAME=log4j-core CV=2.14.1 VULN=CVE-2021-44228
-   ```
-
-   Add `SEVERITY=CRITICAL` and/or `STATUS_EXPECT=IGNORED` to also verify the
-   mapped fields. The JSON output shows how many records matched and any
-   mismatch (`severity: expected CRITICAL, got 9.8`).
-
-A record matches when the component name, version and vulnerability id all
-appear in the same record. If SVM paginates, ask for a large page in `params`
-or filter by component so the match is on the first page.
-
-## 5. Wire up the pipeline trigger
-
-The pipeline is whatever makes SVM pick up Black Duck changes. Choose one:
-
-| Your situation | Config |
+| Failing check | Usually |
 |---|---|
-| GitLab pipeline | `pipeline.type: gitlab` + `project_id`, `trigger_token`, optional `access_token` to wait for completion |
-| Another CI with an HTTP trigger | `pipeline.type: webhook` + `webhook.url`, `headers`, `body` |
-| A script/CLI | `pipeline.type: command` + `command.argv: ["./sync.sh", "{run_id}"]` |
-| Sync runs on its own schedule | `pipeline.type: none`, and set `test.wait_hours` above the schedule interval |
+| auth | wrong `BD_API_KEY` / `BD_HOST` |
+| server version | wrong host, proxy, or path override (`BD_PATH_CURRENT_VERSION`) |
+| project / version | not created yet, or the token's user has no access |
+| KB component | `BD_COMPONENT_NAME` / `BD_COMPONENT_VERSION` not in the knowledge base |
 
-GitLab example:
-
-```yaml
-pipeline:
-  type: gitlab
-  gitlab:
-    base_url: https://gitlab.mycompany.com
-    project_id: "1234"
-    trigger_token: ${GITLAB_TRIGGER_TOKEN}
-    access_token: ${GITLAB_ACCESS_TOKEN}   # read_api, needed to poll status
-    ref: main
-```
-
-Try it on its own:
+## 4. Run phase 1 and phase 2 locally
 
 ```bash
-make pipeline-trigger
+make phase1        # 12 steps: add, verify, assess, remediate, write state.json
+make state-show    # the IDs and counts handed to phase 2
+make phase2        # 5 steps: fresh auth, delete, verify the baseline is restored
 ```
 
-## 6. Run your first real cycle
+Or the whole cycle in one command, with the real 4-hour wait (or none):
 
 ```bash
-make test             # offline checks still pass
-make doctor           # connectivity and config
-make smoke            # tiny deadline; proves add -> verify -> delete in Black Duck
+make cycle                  # health → phase1 → wait 4h → phase2
+make cycle WAIT_HOURS=0     # same, without waiting (quick end-to-end check)
+make cycle WAIT_HOURS=0.5   # custom wait
 ```
 
-`smoke` will most likely end with a `FAILED` run (SVM cannot sync within ~36
-seconds). That is expected — what matters is that the Black Duck steps worked
-and the component was cleaned up (`make bd-bom` shows an empty test BOM).
+What a successful run proves:
 
-Now a real one:
-
-```bash
-make start            # adds the batch, verifies it in Black Duck, saves the run
-make status           # shows NEXT STEP DUE
-make tick             # run whenever due; or schedule it (next section)
-make drain            # alternative: block until the run finishes
-```
-
-## 7. Schedule it
-
-Runs are resumable, so you just call `make tick-idle` regularly. It advances
-due runs and starts a new cycle when capacity allows.
-
-| Where | How |
+| Evidence | Where |
 |---|---|
-| cron | `*/20 * * * * cd /opt/bd-svm-automation && make tick-idle >> /var/log/bd-svm.log 2>&1` |
-| Always-on host | `make loop` (add `--stop-on-failure` via `python -m bd_svm loop --stop-on-failure`) |
-| GitHub Actions | enable `.github/workflows/e2e-sync.yml` — see [section 15](#15-run-in-docker-or-github-actions) |
+| component added: BOM count `N → N+1`, flagged `MANUAL_BOM_COMPONENT` | phase 1 steps 05–06 |
+| usage + reviewStatus persisted | steps 08–09 |
+| CVE remediated to `NOT_AFFECTED` and persisted | steps 11–12 |
+| component still present after the wait | phase 2 step 03 |
+| deleted with 204, count back to `N`, component gone | phase 2 steps 04–05 |
 
-Only one process should tick at a time.
+If a phase fails, the remaining steps of that phase are *skipped* and, for
+phase 1, the component it added is removed again.
 
-## 8. Read the results
+## 5. Read the HTML report
 
 ```bash
-make status          # one line per run: status, phase, next step due, components
-make report          # reports/report.md with per-item results and sync latency
-make report-junit    # reports/junit.xml for a CI test tab
-make report-json     # reports/summary.json
-make status-json     # everything: events, per-item checks, evidence
+make report         # opens reports/*.html (or just open the file)
 ```
 
-In `make report`, the **Sync latency** table answers "how long does Black Duck
-→ SVM take?". The **Items** table shows PASS/FAIL per component for the ADD
-and DELETE tests. A run is `PASSED` only when every item passed both tests.
+Each test row can be expanded to show **every API call it made**: method, URL,
+HTTP status, timing, request body and a response snippet, plus notes such as
+`COMPONENT_ID=… COMP_VER_ID=…` and the count audit
+(`baseline 10 → +1 = 11 → −1 = 10 (baseline restored)`). The token is never
+included. When a step fails, start by reading its last call.
 
-## 9. Deal with failures and leftovers
+## 6. Test a different component or CVE
 
-| You see | Meaning | Do |
+Change three settings (`.env` locally, repository variables in GitHub):
+
+```ini
+BD_COMPONENT_NAME=log4j-core
+BD_COMPONENT_VERSION=2.14.1
+BD_VULN_ID=CVE-2021-44228
+```
+
+Requirements: the version exists in the KB, it actually has that CVE, and it is
+**not already in the test BOM**. Check first with `make health` (the KB step).
+
+## 7. Use different assessment values
+
+| Want | Set |
+|---|---|
+| a different final status (e.g. `IGNORED`, `MITIGATED`) | `BD_REMEDIATION_STATUS` |
+| a different reset status | `BD_RESET_STATUS` |
+| different usage / review state | `BD_USAGE`, `BD_REVIEW_STATUS` |
+| a different comment on the assessment | `BD_REMEDIATION_COMMENT` |
+
+Status values must be valid for your Black Duck release; an invalid one shows
+up as an HTTP 4xx on step 07 or 11 in the report. Slow vulnerability
+computation (step 07 cannot find the CVE) → raise `BD_VULN_WAIT_SECONDS`.
+
+## 8. Adapt to your server (paths, media types, TLS)
+
+**API path differs** (gateway prefix, different release): override only the
+key that differs.
+
+```ini
+BD_PATH_PROJECTS=/blackduck/api/projects
+BD_PATH_BOM_COMPONENTS=/blackduck/api/projects/{project_id}/versions/{version_id}/components
+```
+
+Placeholders such as `{project_id}` are filled by the code; keep them. The
+full list of keys and defaults is in [SETTINGS.md](SETTINGS.md#api-paths--configurable).
+Confirm the right paths in `<BD_HOST>/api-doc/public.html`.
+
+**HTTP 406 / unsupported media type** → bump the revision:
+
+```ini
+BD_MEDIA_BOM=application/vnd.blackducksoftware.bill-of-materials-6+json
+```
+
+**Self-signed certificate** (lab only):
+
+```ini
+BD_VERIFY_SSL=false
+```
+
+**Slow or flaky server**: `BD_TIMEOUT` (seconds) and `BD_HTTP_RETRIES`.
+
+## 9. Run it on GitHub Actions
+
+1. Push the repo. In **Settings → Secrets and variables → Actions** add:
+
+   | Kind | Name | Notes |
+   |---|---|---|
+   | Secret | `BD_HOST` | required |
+   | Secret | `BD_API_KEY` | required |
+   | Secret | `NOTIFY_WEBHOOK_URL` | optional (Slack-compatible) |
+   | Variable | `BD_PROJECT_NAME`, `BD_PROJECT_VERSION`, `BD_COMPONENT_NAME`, `BD_COMPONENT_VERSION`, `BD_VULN_ID` | optional, defaults as in [SETTINGS.md](SETTINGS.md) |
+
+2. **Actions → Phase 1 - Setup → Run workflow.** Wait for it to pass (it
+   uploads the `state-json` artifact and `phase1-report`).
+3. **Actions → Phase 2 - Teardown → Run workflow.** It downloads the state from
+   the latest successful phase 1 run and tears down.
+4. Open the uploaded `phase1-report` / `phase2-report` artifacts.
+5. Leave the schedules on: phase 1 at 08:00 UTC, phase 2 at 12:00 UTC daily.
+
+If your Black Duck is not reachable from GitHub-hosted runners, set `runs-on`
+to a self-hosted runner in both workflow files. Details and caveats:
+[GITHUB_ACTIONS.md](GITHUB_ACTIONS.md).
+
+## 10. Change the schedule or the wait
+
+Edit the `cron:` line of each workflow (UTC). The wait between the phases *is*
+the gap between the two cron times:
+
+| Want | phase1.yml | phase2.yml |
 |---|---|---|
-| `ADD TEST failed: … not found` | SVM never showed the component before the deadline | Compare the stored evidence (`make status-json`) with `make svm-check`; check the pipeline ran; check the SVM mapping |
-| `ADD TEST failed: … severity: expected X, got Y` | Present but wrong value | Fix `svm.api.fields` mapping, or this is a real sync defect |
-| `DELETE TEST failed: … found` | SVM kept the record after Black Duck removed it — the bug this test hunts | Investigate SVM sync/removal |
-| `gave up after N attempts` | SVM/Black Duck kept erroring | Check connectivity/tokens, then `make cleanup RUN_ID=<id>` if needed |
-| `cleanup_failed` notification | A test component is still in the test BOM | `make sweep`, then `make sweep-apply YES=1` |
+| 4 h (default) | `0 8 * * *` | `0 12 * * *` |
+| 2 h | `0 8 * * *` | `0 10 * * *` |
+| weekdays only | `0 8 * * 1-5` | `0 12 * * 1-5` |
+| twice a day | add a second `cron:` line to both, 12 h apart | keep a 4 h offset |
 
-Useful commands:
+Keep the artifact lifetime in mind: `retention-days: 1` in `phase1.yml` means the
+gap must stay under a day. Locally use `WAIT_HOURS` (see section 4).
 
-```bash
-make cleanup RUN_ID=bd-svm-20260101T120000Z-ab12   # abort a run and remove its components
-make sweep                                         # list orphans (dry run)
-make sweep-apply YES=1                             # delete them
-make db-backup                                     # copy the state DB
-```
+## 11. Get notified on failure
 
-Failed runs always attempt to remove their components from Black Duck
-automatically.
+1. Create an incoming webhook (Slack, or any Slack-compatible endpoint).
+2. Save it as the secret `NOTIFY_WEBHOOK_URL`.
 
-## 10. Get notified
+Both workflows then post a message with a link to the run when a phase fails.
+Without the secret you still get GitHub's own failure e-mail for the workflow.
 
-1. Create an incoming webhook in Slack (or Teams) and put it in `.env`:
+## 12. Recover after a failed or missed phase
 
-   ```ini
-   NOTIFY_WEBHOOK_URL=https://hooks.slack.com/services/...
-   ```
-
-2. Optional in `config/config.yaml`:
-
-   ```yaml
-   notify:
-     format: slack            # slack | teams | generic
-     on: [failed, cleanup_failed]   # drop "passed" if it is too chatty
-     prefix: "@oncall "
-   ```
-
-3. Test it: `make notify-test`.
-
-## 11. Add the SVM UI check
-
-```bash
-make install-ui          # installs Selenium; needs Chrome/Chromium on the machine
-```
-
-```yaml
-svm:
-  ui:
-    enabled: true
-    url: https://svm.mycompany.com
-    search_url: "{ui_url}/components?search={component_name}"
-    row_selector: "table.vulns tbody tr"     # important: match per row, not the whole page
-    wait_selector: "table.vulns"
-    login:
-      url: https://svm.mycompany.com/login
-      username: ${SVM_UI_USER}
-      password: ${SVM_UI_PASSWORD}
-      username_selector: "#user"
-      password_selector: "#pass"
-      submit_selector: "button[type=submit]"
-```
-
-Find the CSS selectors with your browser's *Inspect*. With `svm.require: all`
-both the API and UI checks must agree; use `any` if either is enough. A
-screenshot of each UI check is saved under `data/evidence/<run_id>/`.
-
-## 12. Test more, faster
-
-| Want | Change |
+| Situation | What to do |
 |---|---|
-| More coverage per run | `test.batch_size: 4` with mixed scenarios |
-| Use the idle time between waits | `test.max_active_runs: 3` and `test.start_interval_minutes: 120` |
-| Faster feedback / finer latency | lower `test.first_check_seconds` and `test.check_interval_seconds` |
-| Less load on SVM | raise `check_interval_seconds` |
-| Strict "exactly N hours" behaviour | `test.mode: fixed` |
+| Phase 1 failed | Nothing to clean up — it removes what it added. Fix the cause from the report and re-run phase 1. |
+| Phase 1 failed *and* the report says "cleanup FAILED" | Remove the component by hand (below). |
+| Phase 2 failed on a count mismatch | The BOM changed in between; nothing was deleted. Check the BOM, then re-run phase 2 or remove by hand. |
+| Phase 2 failed on delete | Re-run phase 2 within a day (artifact still valid). |
+| Phase 2 missed and the artifact expired | Remove the component by hand (below). |
 
-Overlapping cycles share pipeline triggers automatically
-(`pipeline.coalesce: true`), so more cycles do not mean more pipeline runs.
-
-## 13. Do one-off Black Duck operations
-
-Read-only recipes run freely; anything that changes Black Duck needs `YES=1`.
+**Manual removal** using the IDs in `state.json` or the phase 1 report:
 
 ```bash
-make bd-bom                                   # what is in the test BOM
-make bd-vulns                                 # vulnerable components in the BOM
-make bd-add NAME=log4j-core CV=2.14.1 YES=1
-make bd-remediate NAME=log4j-core CV=2.14.1 VULN=CVE-2021-44228 STATUS=IGNORED COMMENT="e2e" YES=1
-make bd-delete NAME=log4j-core CV=2.14.1 YES=1
-make bd-policy ; make bd-risk                 # version policy status / risk profile
-make bd-api METHOD=GET API_PATH=/api/projects # any endpoint
-make bd-add NAME=x CV=1 PROJECT=other VERSION=v2 YES=1   # another project/version
+TOKEN=$(curl -s -X POST -H "Authorization: token $BD_API_KEY" \
+  -H "Accept: application/vnd.blackducksoftware.user-4+json" \
+  "$BD_HOST/api/tokens/authenticate" | python3 -c 'import sys,json; print(json.load(sys.stdin)["bearerToken"])')
+
+curl -i -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "$BD_HOST/api/projects/$PROJECT_ID/versions/$VERSION_ID/components/$COMPONENT_ID/versions/$COMP_VER_ID"
+# expect: HTTP 204
 ```
 
-Full list: `make help`, or [OPERATIONS.md](OPERATIONS.md#make-recipe-reference).
+or delete it in the Black Duck UI (BOM → remove the manually added component).
 
-## 14. Adapt to a different Black Duck version
+Re-running **phase 1** while a previous component is still in the BOM stops at
+step 05 ("already in the BOM") — that is deliberate.
 
-Every endpoint and media type is configuration. If a call fails with HTTP
-404/406 on your server:
+## 13. Add a step, assertion or API helper
 
-1. Open `<BLACKDUCK_URL>/api-doc/public.html` and find the right path or
-   `application/vnd.blackducksoftware.*` version.
-2. Override only that key in `config/config.yaml`:
+**New assertion in a phase**: add a test function to
+`tests/phase1/test_setup.py` or `tests/phase2/test_teardown.py`. Keep the
+`test_NN_name` numbering (pytest runs them in file order) and use the shared
+`ctx` dict for values later steps need:
 
-   ```yaml
-   blackduck:
-     paths:
-       vulnerable_bom_components: /api/projects/{project_id}/versions/{version_id}/vulnerable-bom-components
-     media_types:
-       bom: application/vnd.blackducksoftware.bill-of-materials-6+json
-   ```
+```python
+def test_13_example(client, ctx):
+    item = client.find_bom_item(**_ids(ctx))
+    assert item["ignored"] is False
+```
 
-3. Re-check with `make doctor` and the relevant `make bd-*` read recipe.
+**New API helper**: add a method to `BDClient` in `utils/api_client.py`. Every
+call made through `self.request(...)` is recorded in the HTML report
+automatically. Add the path as a template to `DEFAULT_PATHS` in
+`config/settings.py` so it is overridable with `BD_PATH_<KEY>`.
 
-The list of paths and which are least verified is in
-[BLACKDUCK_API.md](BLACKDUCK_API.md).
+**New value to hand to phase 2**: add the key to `REQUIRED_KEYS` in
+`utils/state.py` and to the dict written in step 12; `load_state()` validates it
+on the other side.
 
-## 15. Run in Docker or GitHub Actions
+Run `make selftest` and `make lint` afterwards.
 
-**Docker**
+## 14. Test the framework itself
 
 ```bash
-make docker-build                       # WITH_UI=1 to include Chromium + Selenium
-make docker-run ARGS="doctor"
-make docker-run ARGS="tick --start-if-idle"
+make selftest     # state handling, token cache, both phases vs the mock,
+                  # incl. failure paths: abort, cleanup, missing state, count drift
+make lint         # ruff
+make ci           # lint + selftest + demo (what CI runs)
 ```
 
-`./data` (state) and `./config` are mounted; secrets come from `.env`.
+These need no credentials. They validate the framework's logic, not your Black
+Duck's API behaviour — see [ASSUMPTIONS.md](ASSUMPTIONS.md) for what still has
+to be confirmed on a real server.
 
-**GitHub Actions**
+## 15. Command cheat sheet
 
-1. Use a **private** repo (the state branch contains component names and Black
-   Duck URLs), or set the `STATE_BACKEND` variable to `s3` and `STATE_S3_URI`.
-2. Add the secrets and variables listed at the top of
-   `.github/workflows/e2e-sync.yml` (at minimum `BLACKDUCK_URL`,
-   `BLACKDUCK_API_TOKEN`, `SVM_URL`, `SVM_API_TOKEN`).
-3. Put your real SVM/pipeline settings in the repository variable
-   `BD_SVM_CONFIG_YAML` (the whole `config.yaml`); otherwise the example config
-   is used and its placeholder SVM path will not work.
-4. *Actions → E2E Black Duck-SVM sync → Run workflow → `doctor`* to verify,
-   then let the 30-minute schedule take over.
-5. Results: job summary, `bd-svm-reports` artifact, and failure notifications.
-
-If Black Duck or SVM are not reachable from GitHub-hosted runners, change
-`runs-on` to a self-hosted runner.
+| Goal | Command |
+|---|---|
+| install | `make install` |
+| smoke test | `make health` |
+| phase 1 / phase 2 | `make phase1` / `make phase2` |
+| both, with / without the wait | `make cycle` / `make cycle WAIT_HOURS=0` |
+| show handed-over state | `make state-show` |
+| open reports | `make report` |
+| offline demo / self-tests | `make demo` / `make selftest` |
+| mock server | `make mock-server` |
+| lint / fix / CI bundle | `make lint` / `make fix` / `make ci` |
+| clean | `make clean` / `make distclean` |
+| list everything | `make help` |

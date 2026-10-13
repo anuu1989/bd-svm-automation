@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Full demo against the in-process mock Black Duck/SVM: no credentials needed.
+# Both phases end to end against devtools/mock_blackduck.py (no credentials).
 set -euo pipefail
 PY="${PY:-.venv/bin/python}"
-CFG="${CFG:-config/config.mock.yaml}"
-PORT="${PORT:-8099}"
+PORT="${PORT:-8098}"
 
-rm -f data/mock-state.db
-$PY -m bd_svm.mock_server --port "$PORT" >/dev/null &
+export BD_HOST="http://127.0.0.1:$PORT" BD_API_KEY=mock BD_HTTP_RETRIES=0 BD_VULN_WAIT_SECONDS=5
+export STATE_FILE="${STATE_FILE:-$(mktemp -d)/state.json}"
+
+$PY -m devtools.mock_blackduck --port "$PORT" >/dev/null &
 MOCK=$!
 trap 'kill $MOCK 2>/dev/null || true' EXIT
-for _ in $(seq 1 50); do curl -fs "http://127.0.0.1:$PORT/mock/state" >/dev/null && break; sleep 0.2; done
+for _ in $(seq 1 50); do curl -fs "$BD_HOST/mock/state" >/dev/null && break; sleep 0.2; done
 
-echo ">>> start (adds 4 components: standard, remediation, upgrade, negative)"
-$PY -m bd_svm -c "$CFG" start
-echo ">>> drain (polls SVM until both tests finish)"
-$PY -m bd_svm -c "$CFG" drain --fast
-echo ">>> report"
-$PY -m bd_svm -c "$CFG" report
-echo ">>> mock BOM afterwards (must be empty):"
-curl -s "http://127.0.0.1:$PORT/mock/state"; echo
+echo ">>> baseline:        $(curl -s "$BD_HOST/mock/state" | $PY -c 'import json,sys; print(json.load(sys.stdin)["count"])') components"
+echo ">>> smoke test";     $PY -m pytest -q tests/test_api_health.py
+echo ">>> PHASE 1 (12)";   $PY -m pytest -q tests/phase1
+echo ">>> state.json:";    cat "$STATE_FILE"
+echo ">>> after phase 1:   $(curl -s "$BD_HOST/mock/state" | $PY -c 'import json,sys; print(json.load(sys.stdin)["count"])') components"
+echo ">>> PHASE 2 (5)";    $PY -m pytest -q tests/phase2
+echo ">>> after phase 2:   $(curl -s "$BD_HOST/mock/state" | $PY -c 'import json,sys; print(json.load(sys.stdin)["count"])') components (baseline restored)"

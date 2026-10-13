@@ -1,0 +1,64 @@
+# PHASE 2 - teardown: fresh auth, load state.json from the latest successful
+# Phase 1 run, verify count still N+1, delete the component (204), verify the
+# count is back to the baseline N.
+# Runs at 12:00 UTC = 4 hours after phase1.yml.
+name: Phase 2 - Teardown
+
+on:
+  schedule:
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read          # download the state.json artifact of phase1.yml
+
+concurrency:
+  group: bd-api-cycle
+  cancel-in-progress: false
+
+jobs:
+  phase2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BD_HOST: ${{ secrets.BD_HOST }}
+      BD_API_KEY: ${{ secrets.BD_API_KEY }}
+      NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Download state.json from the latest successful Phase 1 run
+        run: |
+          run_id=$(gh run list --workflow phase1.yml --status success --limit 1 \
+                     --json databaseId --jq '.[0].databaseId')
+          if [ -z "$run_id" ]; then
+            echo "No successful Phase 1 run found (artifact expires after 1 day)."; exit 1
+          fi
+          echo "Using Phase 1 run $run_id"
+          gh run download "$run_id" --name state-json --dir .
+          test -f state.json
+
+      - name: Phase 2 - teardown (test_teardown.py, 5 steps)
+        run: mkdir -p reports && pytest tests/phase2 --html=reports/phase2-report.html --self-contained-html
+
+      - name: Upload phase2-report.html
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-report
+          path: reports/*.html
+          if-no-files-found: ignore
+
+      - name: Phase 2 failed - notify team
+        if: failure() && env.NOTIFY_WEBHOOK_URL != ''
+        run: |
+          curl -sS -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"Phase 2 FAILED (component may still be in the BOM): ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+            "$NOTIFY_WEBHOOK_URL"

@@ -1,0 +1,70 @@
+# PHASE 1 - setup: add component, verify, reset + update review state,
+# remediate CVE, verify, write state.json -> upload as artifact (1 day).
+# Runs at 08:00 UTC; phase2.yml follows at 12:00 UTC (4 hours later).
+#
+# Secrets:   BD_HOST  BD_API_KEY  NOTIFY_WEBHOOK_URL (optional)
+# Variables: BD_PROJECT_NAME BD_PROJECT_VERSION BD_COMPONENT_NAME BD_COMPONENT_VERSION BD_VULN_ID (all optional)
+name: Phase 1 - Setup
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bd-api-cycle
+  cancel-in-progress: false
+
+jobs:
+  phase1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BD_HOST: ${{ secrets.BD_HOST }}
+      BD_API_KEY: ${{ secrets.BD_API_KEY }}
+      BD_PROJECT_NAME: ${{ vars.BD_PROJECT_NAME }}
+      BD_PROJECT_VERSION: ${{ vars.BD_PROJECT_VERSION }}
+      BD_COMPONENT_NAME: ${{ vars.BD_COMPONENT_NAME }}
+      BD_COMPONENT_VERSION: ${{ vars.BD_COMPONENT_VERSION }}
+      BD_VULN_ID: ${{ vars.BD_VULN_ID }}
+      NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Smoke test (test_api_health.py)
+        run: mkdir -p reports && pytest tests/test_api_health.py --html=reports/health-report.html --self-contained-html
+
+      - name: Phase 1 - setup (test_setup.py, 12 steps)
+        run: pytest tests/phase1 --html=reports/phase1-report.html --self-contained-html
+
+      - name: Upload state.json (expires in 1 day)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-json
+          path: state.json
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload phase1-report.html
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-report
+          path: reports/*.html
+          if-no-files-found: ignore
+
+      - name: Phase 1 failed - notify team
+        if: failure() && env.NOTIFY_WEBHOOK_URL != ''
+        run: |
+          curl -sS -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"Phase 1 FAILED: ${GITHUB_REPOSITORY} run ${GITHUB_RUN_ID} - ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"}" \
+            "$NOTIFY_WEBHOOK_URL"
