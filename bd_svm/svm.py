@@ -1,25 +1,36 @@
-"""SVM verification: API check and (optional) Selenium UI check."""
+"""SVM verification: API check and (optional) Selenium UI check.
+
+A check answers "is this component (+ vulnerability) shown in SVM?" and, for
+the API check, optionally "are the field values right?" (severity,
+remediation status). Each result carries `evidence` that is stored with the run.
+"""
 from __future__ import annotations
 
 import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-import requests
+from .http import make_session
 
 log = logging.getLogger(__name__)
 
 
 @dataclass
 class CheckResult:
-    name: str            # "api" | "ui"
-    found: bool | None   # None = check errored / skipped
+    name: str                       # "api" | "ui"
+    found: bool | None              # None = check errored / skipped
     detail: str = ""
     error: str = ""
+    fields_ok: bool | None = None   # None = no field expectations / not applicable
+    field_issues: list = field(default_factory=list)
+    evidence: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
-        return {"name": self.name, "found": self.found, "detail": self.detail, "error": self.error}
+        return {"name": self.name, "found": self.found, "detail": self.detail, "error": self.error,
+                "fields_ok": self.fields_ok, "field_issues": self.field_issues,
+                "evidence": self.evidence}
 
 
 @dataclass
@@ -29,7 +40,8 @@ class Subject:
     component_version: str
     vuln_id: str
     project_name: str = ""
-    extra: dict = field(default_factory=dict)
+    expected: dict = field(default_factory=dict)  # severity, remediation_status
+    extra: dict = field(default_factory=dict)     # evidence_prefix, max_records
 
     def fmt(self) -> dict:
         return {"component_name": self.component_name, "component_version": self.component_version,
@@ -62,11 +74,31 @@ def record_matches(record: Any, subject: Subject, match_version: bool = True) ->
     return True
 
 
+def dig(obj: Any, dotted: str) -> Any:
+    for part in dotted.split("."):
+        obj = obj.get(part) if isinstance(obj, dict) else None
+    return obj
+
+
+def check_fields(record: Any, expected: dict, mapping: dict) -> list[str]:
+    """Compare expected values with the record. Unmapped / empty expectations are skipped."""
+    issues = []
+    for key, want in (expected or {}).items():
+        path = (mapping or {}).get(key)
+        if not path or want in (None, ""):
+            continue
+        got = dig(record, path)
+        if str(got).strip().lower() != str(want).strip().lower():
+            issues.append(f"{key}: expected {want}, got {got}")
+    return issues
+
+
 class SvmApiCheck:
     name = "api"
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, session=None):
         self.cfg = cfg
+        self.http = session or make_session(int(cfg.retries or 0))
 
     def check(self, subject: Subject) -> CheckResult:
         c, f = self.cfg, subject.fmt()
@@ -76,14 +108,23 @@ class SvmApiCheck:
         url = c.base_url.rstrip("/") + "/" + c.path.format(**f).lstrip("/")
         params = {k: str(v).format(**f) for k, v in (c.params or {}).items()}
         try:
-            resp = requests.request(c.method, url, headers=headers, params=params,
-                                    verify=bool(c.verify_ssl), timeout=c.timeout_seconds)
+            resp = self.http.request(c.method, url, headers=headers, params=params,
+                                     verify=bool(c.verify_ssl), timeout=c.timeout_seconds)
             resp.raise_for_status()
             records = extract_records(resp.json(), c.list_key or "")
         except Exception as exc:  # network / HTTP / JSON
             return CheckResult(self.name, None, error=f"{type(exc).__name__}: {exc}")
         hits = [r for r in records if record_matches(r, subject, bool(c.match_version))]
-        return CheckResult(self.name, bool(hits), f"{len(hits)}/{len(records)} records match")
+        keep = int(subject.extra.get("max_records", 5))
+        result = CheckResult(self.name, bool(hits), f"{len(hits)}/{len(records)} records match",
+                             evidence={"url": url, "http_status": resp.status_code,
+                                       "records_total": len(records), "matched": hits[:keep]})
+        if hits and c.fields and subject.expected:
+            per_hit = [check_fields(h, subject.expected, c.fields) for h in hits]
+            result.fields_ok = any(not issues for issues in per_hit)
+            if not result.fields_ok:
+                result.field_issues = per_hit[0]
+        return result
 
 
 class SvmUiCheck:
@@ -105,6 +146,7 @@ class SvmUiCheck:
         if c.headless:
             opts.add_argument("--headless=new")
         driver = webdriver.Chrome(options=opts)
+        evidence: dict = {}
         try:
             if c.login.url:
                 driver.get(c.login.url)
@@ -113,16 +155,26 @@ class SvmUiCheck:
                 driver.find_element(By.CSS_SELECTOR, c.login.submit_selector).click()
             url = c.search_url.format(ui_url=c.url.rstrip("/"), **subject.fmt())
             driver.get(url)
+            evidence["url"] = url
             WebDriverWait(driver, c.wait_seconds).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, c.wait_selector)))
             if c.row_selector:
                 rows = [r.text for r in driver.find_elements(By.CSS_SELECTOR, c.row_selector)]
             else:
                 rows = [driver.find_element(By.TAG_NAME, "body").text]
+            prefix = subject.extra.get("evidence_prefix")
+            if prefix:
+                shot = Path(f"{prefix}-ui.png")
+                shot.parent.mkdir(parents=True, exist_ok=True)
+                driver.save_screenshot(str(shot))
+                evidence["screenshot"] = str(shot)
             hits = [r for r in rows if record_matches(r, subject, bool(c.match_version))]
-            return CheckResult(self.name, bool(hits), f"{len(hits)}/{len(rows)} UI rows match")
+            keep = int(subject.extra.get("max_records", 5))
+            evidence["matched_rows"] = [h[:300] for h in hits[:keep]]
+            return CheckResult(self.name, bool(hits), f"{len(hits)}/{len(rows)} UI rows match",
+                               evidence=evidence)
         except Exception as exc:
-            return CheckResult(self.name, None, error=f"{type(exc).__name__}: {exc}")
+            return CheckResult(self.name, None, error=f"{type(exc).__name__}: {exc}", evidence=evidence)
         finally:
             driver.quit()
 
@@ -143,7 +195,17 @@ def evaluate(results: list[CheckResult], expect_present: bool, require: str = "a
     if any(r.found is None for r in results):
         errs = "; ".join(f"{r.name}: {r.error}" for r in results if r.found is None)
         return False, f"check error ({errs})"
-    verdicts = [r.found == expect_present for r in results]
+
+    def good(r: CheckResult) -> bool:
+        return bool(r.found and r.fields_ok is not False) if expect_present else not r.found
+
+    verdicts = [good(r) for r in results]
     ok = all(verdicts) if require == "all" else any(verdicts)
     want = "present" if expect_present else "absent"
-    return ok, f"expected {want}; " + ", ".join(f"{r.name}={'found' if r.found else 'not found'}" for r in results)
+    parts = []
+    for r in results:
+        part = f"{r.name}={'found' if r.found else 'not found'}"
+        if r.field_issues:
+            part += " [" + "; ".join(r.field_issues) + "]"
+        parts.append(part)
+    return ok, f"expected {want}; " + ", ".join(parts)

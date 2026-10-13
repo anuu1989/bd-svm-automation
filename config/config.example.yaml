@@ -30,11 +30,17 @@ blackduck:
     bom: application/vnd.blackducksoftware.bill-of-materials-6+json
     vulnerability: application/vnd.blackducksoftware.vulnerability-4+json
 
-  # Components tried (in order) when looking for a vulnerable component.
+  # Candidate components, tried in order; up to test.batch_size are used per cycle.
+  # scenario (default standard):
+  #   standard     appears in SVM, disappears after delete
+  #   remediation  + remediation `status` set in Black Duck must show in SVM
+  #   upgrade      after delete, swapped to `upgrade_to`; old vuln must disappear
+  #   negative     version with NO vulnerabilities must NOT appear in SVM
   candidates:
     - { name: log4j-core, version: "2.14.1" }
-    - { name: jackson-databind, version: "2.9.8" }
-    - { name: commons-text, version: "1.9" }
+    - { name: jackson-databind, version: "2.9.8", scenario: remediation, status: IGNORED }
+    - { name: commons-text, version: "1.9", scenario: upgrade, upgrade_to: "1.10.0" }
+    # - { name: some-clean-lib, version: "1.0.0", scenario: negative }
 
   vulnerability_severities: []          # e.g. [CRITICAL, HIGH]
 
@@ -56,6 +62,8 @@ svm:
     path: /api/vulnerabilities          # <-- set to your SVM endpoint
     params: { component: "{component_name}" }
     list_key: ""                        # dotted path to the record list
+    # Field-level checks: expected value -> dotted key in the SVM record.
+    # fields: { severity: severity, remediation_status: status }
   ui:
     enabled: false                      # needs `make install-ui` + Chrome
     url: ${SVM_UI_URL:-}
@@ -67,6 +75,8 @@ svm:
 pipeline:
   type: gitlab                          # gitlab | webhook | command | none
   wait_for_completion: true
+  coalesce: true                        # reuse a trigger that started after the BD change
+  retrigger_every_seconds: 0            # 0 = never re-trigger within a phase
   gitlab:
     base_url: ${GITLAB_URL:-https://gitlab.com}
     project_id: ${GITLAB_PROJECT_ID:-}
@@ -74,6 +84,17 @@ pipeline:
     access_token: ${GITLAB_ACCESS_TOKEN:-}
     ref: main
 
+notify:                                 # Slack-compatible incoming webhook
+  webhook_url: ${NOTIFY_WEBHOOK_URL:-}
+  format: slack                         # slack | teams | generic
+  on: [failed, passed, cleanup_failed]
+
 test:
-  wait_hours: 8
+  mode: poll                            # poll: pass as soon as SVM matches; fixed: one check after wait_hours
+  wait_hours: 8                         # deadline (poll) / fixed wait
+  first_check_seconds: 900              # poll: first SVM check after add/delete
+  check_interval_seconds: 600           # poll: interval between checks
+  batch_size: 1                         # components per cycle
+  max_active_runs: 1                    # >1 overlaps cycles (one pipeline trigger serves them all)
+  start_interval_minutes: 0
   state_db: data/state.db

@@ -1,16 +1,19 @@
 # Black Duck -> SVM end-to-end sync test.
 #
-# The flow has two 8h waits, so it is NOT one long job. A scheduled run calls
+# The flow has long waits, so it is NOT one long job. A scheduled run calls
 # `make tick-idle` every 30 minutes:
-#   - nothing active  -> starts a cycle (add component, verify in Black Duck)
-#   - a wait elapsed  -> triggers the pipeline, runs SVM API/UI checks, advances
-# State (data/state.db) is carried between runs with the Actions cache.
+#   - capacity available -> starts a cycle (adds a batch, verifies in Black Duck)
+#   - a check is due     -> triggers the pipeline (coalesced), polls SVM, advances
+# State (data/state.db) is persisted between runs on the `bd-svm-state` branch
+# (scripts/state.sh). Use a PRIVATE repo, or set STATE_BACKEND=s3.
 #
 # Setup: Settings > Secrets and variables > Actions
 #   Secrets:   BLACKDUCK_URL BLACKDUCK_API_TOKEN SVM_URL SVM_API_TOKEN
 #              GITLAB_TRIGGER_TOKEN GITLAB_ACCESS_TOKEN SVM_UI_USER SVM_UI_PASSWORD
+#              NOTIFY_WEBHOOK_URL
 #   Variables: BLACKDUCK_PROJECT BLACKDUCK_PROJECT_VERSION GITLAB_URL GITLAB_PROJECT_ID
 #              SVM_UI_URL  SVM_UI_ENABLED ("true" to install Selenium)
+#              STATE_BACKEND (git-branch | s3 | none; default git-branch)
 #              BD_SVM_CONFIG_YAML (optional: full config.yaml; default is config.example.yaml)
 name: E2E Black Duck-SVM sync
 
@@ -23,7 +26,7 @@ on:
         description: Make target to run
         type: choice
         default: tick-idle
-        options: [tick-idle, doctor, start, tick, status, status-json, report, cleanup]
+        options: [tick-idle, doctor, start, tick, drain, status, status-json, report, sweep, sweep-apply, cleanup, notify-test]
       run_id:
         description: Run id (only for cleanup)
         type: string
@@ -35,7 +38,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write               # push the bd-svm-state branch
 
 jobs:
   tick:
@@ -55,7 +58,9 @@ jobs:
       GITLAB_PROJECT_ID: ${{ vars.GITLAB_PROJECT_ID }}
       GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
       GITLAB_ACCESS_TOKEN: ${{ secrets.GITLAB_ACCESS_TOKEN }}
+      NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
       BD_SVM_CONFIG_YAML: ${{ vars.BD_SVM_CONFIG_YAML }}
+      STATE_BACKEND: ${{ vars.STATE_BACKEND || 'git-branch' }}
       ACTION: ${{ inputs.action || 'tick-idle' }}
       RUN_ID: ${{ inputs.run_id }}
     steps:
@@ -66,12 +71,8 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Restore state DB
-        uses: actions/cache/restore@v4
-        with:
-          path: data
-          key: bd-svm-state-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: bd-svm-state-
+      - name: Restore state
+        run: make state-pull
 
       - name: Write config
         run: |
@@ -89,29 +90,33 @@ jobs:
       - name: Run make target
         run: |
           case "$ACTION" in
-            tick-idle|doctor|start|tick|status|status-json|report) make "$ACTION" ;;
+            tick-idle|doctor|start|tick|drain|status|status-json|report|sweep|notify-test) make "$ACTION" ;;
+            sweep-apply) make sweep-apply YES=1 ;;
             cleanup) make cleanup RUN_ID="$RUN_ID" ;;
             *) echo "unknown action: $ACTION"; exit 2 ;;
           esac
 
-      - name: Always write status and report
+      - name: Reports
         if: always()
         run: |
-          mkdir -p reports
           make status || true
-          make report || true
+          make report report-junit report-json || true
 
-      - name: Save state DB
+      - name: Save state
         if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: data
-          key: bd-svm-state-${{ github.run_id }}-${{ github.run_attempt }}
+        run: make state-push
 
-      - name: Upload report
+      - name: Publish test summary
+        if: always()
+        run: |
+          [ -f reports/report.md ] && cat reports/report.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bd-svm-report
-          path: reports/report.md
+          name: bd-svm-reports
+          path: |
+            reports/
+            data/evidence/
           if-no-files-found: ignore

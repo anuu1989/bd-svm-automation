@@ -13,7 +13,8 @@ from pathlib import Path
 
 
 class Store:
-    def __init__(self, path: str):
+    def __init__(self, path: str, clock=time.time):
+        self.clock = clock
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
@@ -27,6 +28,16 @@ class Store:
                  updated_at REAL NOT NULL,
                  data TEXT NOT NULL         -- JSON blob (component, vuln, results, events)
                )""")
+        self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        self.db.commit()
+
+    def get_meta(self, key: str):
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return json.loads(row["value"]) if row else None
+
+    def set_meta(self, key: str, value) -> None:
+        self.db.execute("INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, json.dumps(value)))
         self.db.commit()
 
     @staticmethod
@@ -36,7 +47,7 @@ class Store:
         return d
 
     def create(self, run_id: str, phase: str, due_at: float, data: dict) -> None:
-        now = time.time()
+        now = self.clock()
         self.db.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?)",
                         (run_id, "ACTIVE", phase, due_at, now, now, json.dumps(data)))
         self.db.commit()
@@ -47,7 +58,7 @@ class Store:
         self.db.execute(
             "UPDATE runs SET status=?, phase=?, due_at=?, updated_at=?, data=? WHERE run_id=?",
             (status or cur["status"], phase or cur["phase"],
-             cur["due_at"] if due_at is None else due_at, time.time(),
+             cur["due_at"] if due_at is None else due_at, self.clock(),
              json.dumps(data if data is not None else cur["data"]), run_id))
         self.db.commit()
 

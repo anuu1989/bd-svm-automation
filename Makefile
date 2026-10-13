@@ -26,12 +26,14 @@ SCOPE   := $(if $(PROJECT),--project "$(PROJECT)") $(if $(VERSION),--version "$(
 COMP    := $(if $(HREF),--href "$(HREF)",--name "$(NAME)" --component-version "$(CV)")
 CONFIRM := $(if $(YES),--yes)
 
-.PHONY: help venv install install-ui config test lint check ci doctor start tick tick-idle loop status \
+.PHONY: help venv install install-ui install-dev config test lint fix check ci doctor start tick tick-idle loop status \
         status-json report cleanup smoke clean distclean db-backup db-reset \
         bd-whoami bd-projects bd-versions bd-bom bd-vulns bd-search bd-component-vulns bd-vuln \
         bd-upgrade bd-policy bd-risk bd-bom-status bd-codelocations bd-add bd-delete bd-ignore \
         bd-unignore bd-remediate bd-create-project bd-create-version bd-delete-version \
-        bd-delete-project bd-api svm-check svm-check-absent pipeline-trigger need-name need-vuln
+        bd-delete-project bd-api svm-check svm-check-absent pipeline-trigger need-name need-vuln \
+        drain sweep sweep-apply notify-test report-junit report-json mock-server demo \
+        state-pull state-push docker-build docker-run
 
 help:  ## Show this help
 	@awk 'BEGIN{FS=":.*## "} /^[a-zA-Z_-]+:.*## /{printf "  \033[36m%-20s\033[0m %s\n",$$1,$$2}' $(MAKEFILE_LIST)
@@ -47,6 +49,9 @@ install: venv  ## Install runtime dependencies
 
 install-ui: install  ## Also install Selenium for the SVM UI check
 	$(BIN)/pip install -r requirements-ui.txt
+
+install-dev: install  ## Install dev tools (ruff)
+	$(BIN)/pip install -q -r requirements-dev.txt
 
 config:  ## Create config/config.yaml and .env from the examples (never overwrites)
 	@test -f $(CONFIG) || cp config/config.example.yaml $(CONFIG)
@@ -82,18 +87,42 @@ cleanup: install  ## Abort + remove component from Black Duck: make cleanup RUN_
 	@test -n "$(RUN_ID)" || (echo "usage: make cleanup RUN_ID=<run id>"; exit 1)
 	$(CLI) cleanup $(RUN_ID)
 
-smoke: install  ## Fast end-to-end run with a tiny wait (0.01h): start, sleep, tick x2
+smoke: install  ## Quick real-system run: tiny deadline (--wait-hours 0.01), start then drain
 	$(CLI) --wait-hours 0.01 start
-	sleep 40 && $(CLI) --wait-hours 0.01 tick
-	sleep 40 && $(CLI) --wait-hours 0.01 tick
+	$(CLI) --wait-hours 0.01 drain --fast
 	$(CLI) status
 
-lint: install  ## Byte-compile all sources (syntax check)
+drain: install  ## Tick until no run is active (one-shot CI job / demo)
+	$(CLI) drain
+
+sweep: install  ## Find orphaned test components in the test BOM (dry run)
+	$(CLI) sweep
+
+sweep-apply: install  ## Delete orphaned test components, needs YES=1
+	@test -n "$(YES)" || (echo "sweep-apply deletes from Black Duck: re-run with YES=1 (preview with: make sweep)"; exit 1)
+	$(CLI) sweep --apply
+
+notify-test: install  ## Send a test notification to NOTIFY_WEBHOOK_URL
+	$(CLI) notify-test
+
+lint: install-dev  ## ruff + byte-compile
+	$(BIN)/ruff check .
 	$(BIN)/python -m compileall -q bd_svm tests
+
+fix: install-dev  ## ruff --fix
+	$(BIN)/ruff check . --fix
 
 check: lint test  ## lint + tests
 
 ci: check  ## What CI should run
+
+report-junit: install  ## Write reports/junit.xml (CI test tab)
+	@mkdir -p reports
+	$(CLI) report --format junit -o reports/junit.xml
+
+report-json: install  ## Write reports/summary.json (incl. sync latency stats)
+	@mkdir -p reports
+	$(CLI) report --format json -o reports/summary.json
 
 status-json: install  ## Full run details (events, results) as JSON
 	$(CLI) status --json
@@ -198,6 +227,27 @@ svm-check-absent: install need-name  ## SVM: is NAME CV absent? (delete test) ex
 
 pipeline-trigger: install  ## Trigger the verification pipeline now
 	$(CLI) pipeline-trigger
+
+# ---- Demo / mock -------------------------------------------------------------------
+mock-server: install  ## Run the fake Black Duck + SVM + pipeline on :8099
+	$(BIN)/python -m bd_svm.mock_server --port 8099
+
+demo: install  ## Full flow against the mock: all scenarios, no credentials
+	PY=$(BIN)/python ./scripts/demo.sh
+
+# ---- Durable state (for CI runners) ---------------------------------------------------
+state-pull:  ## Restore data/state.db (STATE_BACKEND=git-branch|s3|none)
+	./scripts/state.sh pull
+
+state-push:  ## Save data/state.db (STATE_BACKEND=git-branch|s3|none)
+	./scripts/state.sh push
+
+# ---- Container -------------------------------------------------------------------------
+docker-build:  ## Build the image (WITH_UI=1 to include Chromium + Selenium)
+	docker build --build-arg WITH_UI=$(or $(WITH_UI),0) -t bd-svm .
+
+docker-run:  ## Run a command in the image: make docker-run ARGS="tick --start-if-idle"
+	docker run --rm --env-file .env -v "$$PWD/data:/app/data" -v "$$PWD/config:/app/config" bd-svm $(ARGS)
 
 clean:  ## Remove caches and reports
 	find . -name __pycache__ -type d -prune -exec rm -rf {} +

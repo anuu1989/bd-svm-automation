@@ -5,18 +5,27 @@ reflected in the **SVM** UI/API after the sync pipeline runs — for both
 *adding* and *removing* a vulnerable component.
 
 ```
-find vulnerable component → add to Black Duck → verify BD assessment → save transaction
-   → wait 8h → trigger pipeline → SVM API + UI check → ADD TEST
+select batch → add to Black Duck → verify BD assessment (+ remediation) → save transaction
+   → trigger pipeline → poll SVM API + UI (≤ 8h deadline, latency recorded) → ADD TEST
    → delete from Black Duck → verify BD deleted
-   → wait 8h → trigger pipeline → SVM API + UI check → DELETE TEST → next cycle
+   → trigger pipeline → poll SVM API + UI → DELETE TEST → notify → next cycle
 ```
+
+Highlights: **polling** with measured sync latency · **batches** of components
+with four **scenarios** (standard, remediation, upgrade, negative) ·
+**overlapping cycles** sharing one pipeline trigger · **field-level** SVM
+checks (severity, remediation status) · **evidence** capture · Slack/Teams
+**notifications** · Markdown/**JUnit**/JSON reports · **orphan sweeper** ·
+durable state for CI · retries with backoff · a **mock server** so everything
+runs offline (`make demo`).
 
 ## Quick start
 
 ```bash
 make config        # creates config/config.yaml and .env from the examples
 $EDITOR .env config/config.yaml   # Black Duck URL/token, SVM endpoint, pipeline
-make test          # offline unit + lifecycle tests
+make demo          # whole flow against a built-in mock Black Duck/SVM - no credentials
+make test          # offline unit + integration tests
 make doctor        # validates config and Black Duck connectivity
 make start         # begin one cycle (adds component, verifies in Black Duck)
 make status        # see when the next step is due
@@ -39,13 +48,15 @@ make tick-idle     # advance due runs; schedule this with cron / CI (see docs)
 | SVM API endpoint, auth, response shape | `svm.api.*` |
 | SVM UI selectors / login | `svm.ui.*` |
 | Pipeline trigger (GitLab / webhook / command) | `pipeline.*` |
-| Wait time, retries, DB location | `test.*` |
+| Poll vs fixed, batch size, overlap, retries, DB location | `test.*` |
+| Notifications / evidence | `notify.*`, `evidence.*` |
 
 ## Documentation
 
 | Doc | Contents |
 |---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Flow, state machine, modules, failure semantics |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Flow, state machine, batching/overlap/coalescing, failure semantics |
+| [docs/TESTING.md](docs/TESTING.md) | Scenarios, latency, evidence, mock server, automated tests |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting, with examples |
 | [docs/BLACKDUCK_API.md](docs/BLACKDUCK_API.md) | Endpoints used, payloads, what to verify on your instance |
 | [docs/SVM_AND_PIPELINE.md](docs/SVM_AND_PIPELINE.md) | Wiring the SVM API/UI checks and pipeline trigger |
@@ -64,7 +75,8 @@ The Black Duck client (add, update, delete, projects, versions, BOM,
 vulnerabilities, remediation, policy, risk, code locations, raw passthrough)
 follows the public Hub REST API, but the SVM API/UI
 endpoints and the pipeline are specific to your environment, so those defaults
-are placeholders you must set. The orchestration logic is covered by offline
-tests; the live Black Duck/SVM calls have **not** been exercised against a real
-instance — run `make doctor` and a `make smoke` cycle first (see
-[docs/OPERATIONS.md](docs/OPERATIONS.md)).
+are placeholders you must set. The orchestration is covered by offline tests,
+including integration tests over HTTP against the built-in mock server. The
+live Black Duck/SVM calls have **not** been exercised against a real instance
+(the mock is a model of the API, not the real thing) — run `make doctor` and a
+`make smoke` cycle first (see [docs/OPERATIONS.md](docs/OPERATIONS.md)).

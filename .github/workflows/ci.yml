@@ -20,5 +20,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - name: Lint and test (offline, no secrets needed)
+      - name: Lint and test (offline; includes the mock Black Duck/SVM integration tests)
         run: make ci
+      - name: Demo against the mock server (all scenarios)
+        run: make demo

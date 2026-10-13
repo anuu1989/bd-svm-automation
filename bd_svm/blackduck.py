@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from .http import make_session
+
 log = logging.getLogger(__name__)
 
 MANUAL_MATCH_TYPE = "MANUAL_BOM_COMPONENT"
@@ -30,7 +32,7 @@ class BlackDuckClient:
         self.base = cfg.base_url.rstrip("/")
         self.paths = cfg.paths
         self.media = cfg.media_types
-        self.http = session or requests.Session()
+        self.http = session or make_session(int(cfg.http_retries or 0))
         self.http.verify = bool(cfg.verify_ssl)
         self._bearer: str | None = None
 
@@ -115,12 +117,20 @@ class BlackDuckClient:
                        component_version_href=component_version_href)
         return list(self._paginate(url, accept=self.media.vulnerability))
 
-    def find_vulnerable_component(self, bom: dict[str, str]) -> dict[str, Any]:
-        """Walk configured candidates; return the first one that has a
-        vulnerability and is not already in the target BOM."""
+    def select_components(self, bom: dict[str, str], count: int = 1) -> list[dict[str, Any]]:
+        """Pick up to `count` usable candidates (in order), skipping any that
+        are already in the target BOM.
+
+        scenario=negative needs a component version with NO vulnerabilities;
+        every other scenario needs at least one (filtered by severity).
+        """
         in_bom = {i.get("componentVersion") for i in self.list_bom_components(bom)}
         allowed = {s.upper() for s in (self.cfg.vulnerability_severities or [])}
+        picked: list[dict[str, Any]] = []
         for cand in self.cfg.candidates:
+            if len(picked) >= count:
+                break
+            scenario = str(cand.get("scenario") or "standard").lower()
             resolved = self.resolve_component_version(cand["name"], cand["version"])
             if not resolved:
                 log.info("candidate %s %s not found in Black Duck KB", cand["name"], cand["version"])
@@ -128,14 +138,32 @@ class BlackDuckClient:
             if resolved["component_version_href"] in in_bom:
                 log.info("candidate %s %s already in BOM - skipping", cand["name"], cand["version"])
                 continue
-            vulns = [v for v in self.list_vulnerabilities(resolved["component_version_href"])
-                     if not allowed or str(v.get("severity", "")).upper() in allowed]
-            if vulns:
-                resolved["vuln_id"] = vulns[0]["name"]
-                resolved["vuln_count"] = len(vulns)
-                return resolved
-        raise BlackDuckError("no vulnerable, not-yet-in-BOM candidate component found; "
-                             "extend blackduck.candidates")
+            vulns = self.list_vulnerabilities(resolved["component_version_href"])
+            if scenario == "negative":
+                if vulns:
+                    log.info("negative candidate %s has vulnerabilities - skipping", cand["name"])
+                    continue
+                resolved.update(vuln_id="", vuln_count=0, severity="")
+            else:
+                vulns = [v for v in vulns if not allowed or str(v.get("severity", "")).upper() in allowed]
+                if not vulns:
+                    continue
+                resolved.update(vuln_id=vulns[0]["name"], vuln_count=len(vulns),
+                                severity=str(vulns[0].get("severity", "")))
+            resolved.update(scenario=scenario, status=cand.get("status"))
+            if scenario == "upgrade":
+                target = cand.get("upgrade_to")
+                up = self.resolve_component_version(cand["name"], target) if target else None
+                if not up:
+                    log.info("upgrade target %s %s not found - skipping", cand["name"], target)
+                    continue
+                resolved["upgrade_to"] = up
+            picked.append(resolved)
+        if not picked:
+            raise BlackDuckError("no usable candidate component found "
+                                 "(unknown to the KB, already in BOM, or no vulnerabilities); "
+                                 "extend blackduck.candidates")
+        return picked
 
     # ------------------------------------------------------------------- BOM
     def list_bom_components(self, bom: dict[str, str]) -> list[dict]:
@@ -190,8 +218,8 @@ class BlackDuckClient:
         try:
             i = parts.index("components")
             return {"component_id": parts[i + 1], "component_version_id": parts[i + 3]}
-        except (ValueError, IndexError):
-            raise BlackDuckError(f"not a component version href: {component_version_href}")
+        except (ValueError, IndexError) as exc:
+            raise BlackDuckError(f"not a component version href: {component_version_href}") from exc
 
     @staticmethod
     def _strip_meta(body: dict) -> dict:

@@ -24,7 +24,15 @@ svm:
 - Pagination is not followed — use `params` to request a large page or filter
   server-side by component so the match is in the first page.
 - Any HTTP/JSON error ⇒ result "error" ⇒ the step is retried, never
-  silently passed.
+  silently passed. 429/5xx are also retried with backoff inside the call
+  (`svm.api.retries`).
+- **Field-level checks:** map expected values to keys in the record with
+  `svm.api.fields`, e.g. `{severity: vuln.severity, remediation_status: state}`.
+  A record that matches component/version/vulnerability but has the wrong
+  severity or status fails the ADD test with the mismatch in the message.
+  Comparison is case-insensitive; unmapped fields are skipped.
+- **Evidence:** URL, HTTP status, record count and the matched records are kept
+  with the run (`evidence.max_records`).
 
 ## SVM UI check (`svm.ui`)
 
@@ -60,6 +68,11 @@ DELETE test to be meaningful. If SVM uses SSO you may need to extend
 | `webhook` | HTTP request to `webhook.url` with JSON `body` + `run_id`. Does not wait. |
 | `command` | Runs `command.argv` (`{run_id}` substituted). Non-zero exit fails the test. |
 | `none` | Does nothing — use when the sync pipeline is already scheduled externally and you only want to wait and verify. |
+
+With `pipeline.coalesce` (default) a trigger that started after a run's
+add/delete is reused by other runs and batch items, so overlapping cycles don't
+re-run the pipeline needlessly. A trigger that started *before* the change is
+never reused.
 
 If the verification pipeline is a schedule you don't control, use `none` and
 set `wait_hours` to cover the schedule interval.

@@ -40,6 +40,7 @@ DEFAULTS: dict[str, Any] = {
         "verify_ssl": True,
         "timeout_seconds": 60,
         "page_size": 100,
+        "http_retries": 3,  # retries (with backoff) on 429/5xx for idempotent calls
         # Target BOM that test components are added to / removed from.
         # Use a DEDICATED project version - the tool mutates its BOM.
         "project_name": "${BLACKDUCK_PROJECT:-svm-e2e-test}",
@@ -73,7 +74,11 @@ DEFAULTS: dict[str, Any] = {
             "bom": "application/vnd.blackducksoftware.bill-of-materials-6+json",
             "vulnerability": "application/vnd.blackducksoftware.vulnerability-4+json",
         },
-        # Candidate components used to find "a vulnerable component".
+        # Candidate components. Optional per-candidate keys:
+        #   scenario: standard (default) | remediation | upgrade | negative
+        #   status:   remediation status for scenario=remediation
+        #   upgrade_to: component version to switch to for scenario=upgrade
+        # See docs/TESTING.md for what each scenario asserts.
         "candidates": [
             {"name": "log4j-core", "version": "2.14.1"},
             {"name": "jackson-databind", "version": "2.9.8"},
@@ -105,6 +110,10 @@ DEFAULTS: dict[str, Any] = {
             "params": {"component": "{component_name}"},
             "list_key": "",  # dotted key of the record list, "" = auto-detect
             "match_version": True,
+            # Field-level checks: expected-field -> dotted key in the SVM record.
+            # Supported expected fields: severity, remediation_status. {} = off.
+            "fields": {},
+            "retries": 3,
         },
         # UI check (diagram: "SVM UI check"). Needs: pip install selenium
         "ui": {
@@ -132,6 +141,11 @@ DEFAULTS: dict[str, Any] = {
         # gitlab | webhook | command | none
         "type": "none",
         "wait_for_completion": True,
+        # Reuse a trigger that happened after the run's add/delete instead of
+        # triggering again (one pipeline run serves overlapping cycles).
+        "coalesce": True,
+        # Re-trigger if SVM still doesn't match after N seconds (0 = never).
+        "retrigger_every_seconds": 0,
         "timeout_seconds": 3600,
         "poll_seconds": 30,
         "gitlab": {
@@ -146,11 +160,30 @@ DEFAULTS: dict[str, Any] = {
         "webhook": {"url": "", "method": "POST", "headers": {}, "body": {}},
         "command": {"argv": []},
     },
+    "notify": {
+        "webhook_url": "${NOTIFY_WEBHOOK_URL:-}",
+        "format": "slack",  # slack | teams | generic
+        "on": ["failed", "passed", "cleanup_failed"],
+        "prefix": "",  # e.g. "@oncall "
+    },
+    "evidence": {
+        "dir": "data/evidence",  # UI screenshots land here
+        "max_records": 5,  # SVM records kept in the run for each check
+    },
     "test": {
+        # poll  = check SVM every check_interval_seconds, pass as soon as it
+        #         matches, fail at the wait_hours deadline; records sync latency.
+        # fixed = single check after wait_hours (legacy behaviour).
+        "mode": "poll",
+        "first_check_seconds": 900,
+        "check_interval_seconds": 600,
+        "batch_size": 1,  # components per cycle
+        "max_active_runs": 1,  # >1 overlaps cycles
+        "start_interval_minutes": 0,  # min gap between cycle starts
         "wait_hours": 8,
         "state_db": "data/state.db",
         "max_attempts": 5,  # retries per step on transient errors
-        "poll_seconds": 300,  # `loop` sleep interval
+        "poll_seconds": 300,  # `loop` / `drain` sleep interval
         "retry_seconds": 600,  # delay before retrying a failed step
         "assessment_timeout_seconds": 180,  # wait for BD to compute vulns after add
         "run_prefix": "bd-svm",

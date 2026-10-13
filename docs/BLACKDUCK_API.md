@@ -89,8 +89,24 @@ MITIGATED PATCHED IGNORED DUPLICATE`.
 
 ## Assessment inside the test flow
 
-Set `blackduck.assessment.enabled: true` (with `status` and `comment`) and the
-orchestrator calls `update_remediation` once Black Duck reports the
-vulnerability for the newly added component (i.e. after the assessment is
-verified), recording `remediation_status` in the run. Default is off so the target BOM's reporting
-is not changed unexpectedly.
+Two ways a remediation status ("assessment") is applied during a cycle, always
+after Black Duck reports the vulnerability for the added component:
+
+- per candidate: `scenario: remediation` with `status: IGNORED` (etc.) — the
+  status is also asserted in SVM when `svm.api.fields.remediation_status` is
+  mapped;
+- globally: `blackduck.assessment.enabled: true` applies `status` to every
+  non-negative item.
+
+The applied status is recorded on the item (`remediation_status`). Default is
+off so the target BOM's reporting is not changed unexpectedly.
+
+## Selection and safety
+
+`select_components` resolves each configured candidate through the KB
+(`components_search` → `component_versions` →
+`component_version_vulnerabilities`), skips anything already in the target
+BOM, and enforces the scenario's vulnerability requirement (`negative` needs
+none). `delete_component` only touches the exact component version href a run
+recorded and refuses non-manual BOM items; `sweep` additionally limits itself
+to configured candidate names in the test BOM.
