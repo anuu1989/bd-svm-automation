@@ -1,0 +1,79 @@
+# Copy to config/config.yaml (make config). Anything omitted uses the defaults
+# in bd_svm/config.py. ${VAR} / ${VAR:-default} are expanded from the
+# environment (.env is loaded automatically). Keep secrets in .env, not here.
+
+blackduck:
+  # --- Black Duck location: configurable URL ---------------------------------
+  base_url: ${BLACKDUCK_URL}            # e.g. https://blackduck.mycompany.com
+  api_token: ${BLACKDUCK_API_TOKEN}
+  verify_ssl: true                      # or a path to a CA bundle
+
+  # Dedicated project/version whose BOM is mutated by the test.
+  project_name: ${BLACKDUCK_PROJECT:-svm-e2e-test}
+  project_version: ${BLACKDUCK_PROJECT_VERSION:-main}
+
+  # --- Black Duck API paths: configurable ------------------------------------
+  # Override any of these if your Black Duck version differs.
+  paths:
+    authenticate: /api/tokens/authenticate
+    projects: /api/projects
+    project_versions: /api/projects/{project_id}/versions
+    bom_components: /api/projects/{project_id}/versions/{version_id}/components
+    vulnerable_bom_components: /api/projects/{project_id}/versions/{version_id}/vulnerable-bom-components
+    components_search: /api/components
+    component_versions: "{component_href}/versions"
+    component_version_vulnerabilities: "{component_version_href}/vulnerabilities"
+
+  media_types:
+    authenticate: application/vnd.blackducksoftware.user-4+json
+    default: application/json
+    bom: application/vnd.blackducksoftware.bill-of-materials-6+json
+    vulnerability: application/vnd.blackducksoftware.vulnerability-4+json
+
+  # Components tried (in order) when looking for a vulnerable component.
+  candidates:
+    - { name: log4j-core, version: "2.14.1" }
+    - { name: jackson-databind, version: "2.9.8" }
+    - { name: commons-text, version: "1.9" }
+
+  vulnerability_severities: []          # e.g. [CRITICAL, HIGH]
+
+  # Optionally set a remediation status ("assessment") right after adding.
+  assessment:
+    enabled: false
+    status: IGNORED                     # NEW NEEDS_REVIEW REMEDIATION_REQUIRED REMEDIATION_COMPLETE
+                                        # MITIGATED PATCHED IGNORED DUPLICATE
+    comment: bd-svm e2e test
+
+svm:
+  require: all                          # all | any enabled check must agree
+  api:
+    enabled: true
+    base_url: ${SVM_URL:-}
+    token: ${SVM_API_TOKEN:-}
+    auth_header: Authorization
+    auth_scheme: Bearer
+    path: /api/vulnerabilities          # <-- set to your SVM endpoint
+    params: { component: "{component_name}" }
+    list_key: ""                        # dotted path to the record list
+  ui:
+    enabled: false                      # needs `make install-ui` + Chrome
+    url: ${SVM_UI_URL:-}
+    search_url: "{ui_url}/components?search={component_name}"
+    row_selector: ""
+    login:
+      url: ""
+
+pipeline:
+  type: gitlab                          # gitlab | webhook | command | none
+  wait_for_completion: true
+  gitlab:
+    base_url: ${GITLAB_URL:-https://gitlab.com}
+    project_id: ${GITLAB_PROJECT_ID:-}
+    trigger_token: ${GITLAB_TRIGGER_TOKEN:-}
+    access_token: ${GITLAB_ACCESS_TOKEN:-}
+    ref: main
+
+test:
+  wait_hours: 8
+  state_db: data/state.db
